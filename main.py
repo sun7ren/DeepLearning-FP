@@ -6,6 +6,9 @@ import warnings
 from itertools import batched
 from pathlib import Path
 from random import gauss, randint, random, seed, uniform
+import matplotlib.pyplot as plt
+import numpy as np
+import copy
 
 os.environ["PYGAME_HIDE_SUPPORT_PROMPT"] = "hide"
 
@@ -137,16 +140,15 @@ def evaluate_genome(genome: Genome) -> tuple[float]:
             game.step(int(action_val))
 
             if game.done:
-                rewards.append(-10)
+                rewards.append(-100)
                 break
-            elif game.score >= MAX_SCORE:
-                rewards.append(100)
-                break
-            elif game.score > old_score:
-                rewards.append(10)
-            else:
-                rewards.append(1)
 
+            if game.score > old_score:
+                rewards.append(100)
+            else:
+                rewards.append(-0.01)
+
+                
             old_score = game.score
 
         gamma = 0.99
@@ -197,11 +199,11 @@ def evaluate_genome(genome: Genome) -> tuple[float]:
             break
         elif game.score >= MAX_SCORE:
             fitness += 100
-            break
         elif game.score > old_score:
             fitness += 10
         else:
             fitness += 1
+        
 
         old_score = game.score
 
@@ -210,6 +212,11 @@ def evaluate_genome(genome: Genome) -> tuple[float]:
         _best_model_cache = model
 
     return (fitness,)
+
+def smooth(data, window=5):
+    if len(data) < window:
+        return data
+    return np.convolve(data, np.ones(window)/window, mode='valid')
 
 
 def mutate(genome: Genome, ind_pb: float) -> Genome:
@@ -254,6 +261,8 @@ def train(save_path: Path):
     deap_toolbox.register("evaluate", evaluate_genome)
 
     population = deap_toolbox.population(n=POPULATION_SIZE)
+    best_scores = []
+    avg_scores = []
 
     stats = deap_tools.Statistics(lambda ind: ind.fitness.values[0])
     stats.register("avg", np.mean)
@@ -271,6 +280,9 @@ def train(save_path: Path):
         verbose=True,
     )
 
+    best_scores = logbook.select("max")
+    avg_scores = logbook.select("avg")
+
     model_filepath = save_path.with_suffix(".pytorch")
     model_filepath.parent.mkdir(parents=True, exist_ok=True)
 
@@ -284,9 +296,18 @@ def train(save_path: Path):
         model_filepath,
     )
 
-    print(f"Best fitness: {hof[0].fitness.values[0]}")
-    print(f"Best genome: {hof[0]}")
-    print(f"Model saved to {model_filepath}")
+    plt.figure(figsize=(10,5))
+
+    plt.plot(smooth(best_scores), label="Best Fitness (smoothed)")
+    plt.plot(smooth(avg_scores), label="Avg Fitness (smoothed)")
+
+    plt.xlabel("Generation")
+    plt.ylabel("Score")
+    plt.title("Flappy Bird Learning Curve")
+    plt.legend()
+    plt.grid()
+
+    plt.show()
 
 
 def display(load_path: Path):
