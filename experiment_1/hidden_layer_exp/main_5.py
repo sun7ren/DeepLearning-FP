@@ -12,8 +12,6 @@ import copy
 
 os.environ["PYGAME_HIDE_SUPPORT_PROMPT"] = "hide"
 
-import numpy as np
-
 with warnings.catch_warnings():
     warnings.simplefilter("ignore")
     import pygame
@@ -32,25 +30,16 @@ from game import (
     WIDTH as SCREEN_WIDTH,
 )
 
-# Types
-type GameState2 = tuple[float, float]  # dx, dy
-type GameState3 = tuple[float, float, float]  # dx, dy, y
-
-# Static parameters
-type GameState = GameState3
-
-OPTIMIZER = torch.optim.Adam  # Optimized used during the reinforcment learning
-EPOCHS = 100  # Number of epochs on which each model is trained
-MAX_SCORE = 10  # Stop each run at this score (to avoid infinite runs)
+# Configuration Parameters
+N_INPUTS = 2  
+OPTIMIZER = torch.optim.Adam  
+EPOCHS = 100  
+MAX_SCORE = 10  
 
 POPULATION_SIZE = 50
 GENERATIONS = 50
 MUTATION_PROBABILITY = 0.2
-
 RANDOM_SEED = 42
-
-# Dynamic parameters
-N_INPUTS = int(str(GameState.__value__)[len("GameState") :])
 
 ACTIVATIONS = (
     nn.ReLU,
@@ -60,23 +49,21 @@ ACTIVATIONS = (
     nn.ELU,
 )
 
-MAX_HIDDEN_LAYERS = 10
+MAX_HIDDEN_LAYERS = 5
 MIN_LAYER_SIZE = 1
 MAX_LAYER_SIZE = 10
 MIN_LEARNING_RATE = 1e-4
 MAX_LEARNING_RATE = 1e-1
 
-# [layer_size | activation idx] * MAX_HIDDEN_LAYERS | nb hidden layers | learning rate
-type Genome = list[*([int, int] * MAX_HIDDEN_LAYERS), int, float]
+Genome = list
 
-
-# Genetics
+# Genetics Core
 def create_random_genome() -> Genome:
     genome = []
     for _ in range(MAX_HIDDEN_LAYERS):
         genome.append(randint(MIN_LAYER_SIZE, MAX_LAYER_SIZE))
         genome.append(randint(0, len(ACTIVATIONS) - 1))
-    genome.append(randint(0, MAX_HIDDEN_LAYERS))
+    genome.append(randint(1, MAX_HIDDEN_LAYERS))  # Guard against 0 hidden layers
     genome.append(
         10 ** uniform(np.log10(MIN_LEARNING_RATE), np.log10(MAX_LEARNING_RATE))
     )
@@ -101,7 +88,7 @@ def build_mlp(genome: Genome) -> tuple[torch.nn.Module, torch.optim.Optimizer]:
 
 
 _best_model_cache = None
-_best_fitness_cache = -1
+_best_fitness_cache = -float('inf')
 
 
 def evaluate_genome(genome: Genome) -> tuple[float]:
@@ -109,27 +96,17 @@ def evaluate_genome(genome: Genome) -> tuple[float]:
 
     model, optimizer = build_mlp(genome)
 
-    # Training
+    # Policy Training Loop
     model.train()
     for _ in range(EPOCHS):
         game = FlappyBirdGame(None, None, None, render=False)
-
         log_probs = []
         rewards = []
         old_score = game.score
 
         while True:
-            y, dx, dy = game.get_state()
-
-            if N_INPUTS == 2:
-                game_state = dx, dy
-            elif N_INPUTS == 3:
-                game_state = dx, dy, y
-            else:
-                raise NotImplementedError(
-                    f"missing game state implementation for N_INPUTS={N_INPUTS}"
-                )
-            game_state = torch.tensor(game_state, dtype=torch.float32).unsqueeze(0)
+            dx, dy = game.get_state()   
+            game_state = torch.tensor((dx, dy), dtype=torch.float32).unsqueeze(0)
 
             logits = model(game_state)
             probs = torch.sigmoid(logits)
@@ -147,7 +124,6 @@ def evaluate_genome(genome: Genome) -> tuple[float]:
                 rewards.append(100)
             else:
                 rewards.append(-0.01)
-
                 
             old_score = game.score
 
@@ -159,9 +135,10 @@ def evaluate_genome(genome: Genome) -> tuple[float]:
             discounted_rewards.insert(0, cumulative_reward)
 
         discounted_rewards = torch.tensor(discounted_rewards, dtype=torch.float32)
-        discounted_rewards = (discounted_rewards - discounted_rewards.mean()) / (
-            discounted_rewards.std() + 1e-8
-        )
+        if len(discounted_rewards) > 1:
+            discounted_rewards = (discounted_rewards - discounted_rewards.mean()) / (
+                discounted_rewards.std() + 1e-8
+            )
 
         loss = -torch.sum(torch.stack(log_probs) * discounted_rewards)
 
@@ -169,25 +146,15 @@ def evaluate_genome(genome: Genome) -> tuple[float]:
         loss.backward()
         optimizer.step()
 
-    # Evaluation
+    # Evaluation Phase
     model.eval()
-
     game = FlappyBirdGame(None, None, None, render=False)
     old_score = game.score
     fitness = 0
 
     while True:
-        y, dx, dy = game.get_state()
-
-        if N_INPUTS == 2:
-            game_state = dx, dy
-        elif N_INPUTS == 3:
-            game_state = dx, dy, y
-        else:
-            raise NotImplementedError(
-                f"missing game state implementation for N_INPUTS={N_INPUTS}"
-            )
-        game_state = torch.tensor(game_state, dtype=torch.float32).unsqueeze(0)
+        dx, dy = game.get_state()
+        game_state = torch.tensor((dx, dy), dtype=torch.float32).unsqueeze(0)
 
         with torch.no_grad():
             logits = model(game_state)
@@ -204,14 +171,19 @@ def evaluate_genome(genome: Genome) -> tuple[float]:
         else:
             fitness += 1
         
-
         old_score = game.score
+
+    actual_game_score = game.score
+    
+    # Store actual score directly into genome metadata to bypass multi-objective DEAP limits
+    genome.actual_game_score = float(actual_game_score)
 
     if fitness > _best_fitness_cache:
         _best_fitness_cache = fitness
-        _best_model_cache = model
+        _best_model_cache = copy.deepcopy(model)
 
     return (fitness,)
+
 
 def smooth(data, window=5):
     if len(data) < window:
@@ -240,73 +212,80 @@ def mutate(genome: Genome, ind_pb: float) -> Genome:
     return (genome,)
 
 
-# Mains
 def train(save_path: Path):
+    global _best_fitness_cache, _best_model_cache
+    _best_fitness_cache = -float('inf') 
+
     deap_creator.create("FitnessMax", deap_base.Fitness, weights=(1.0,))
     deap_creator.create("Individual", list, fitness=deap_creator.FitnessMax)
 
     deap_toolbox = deap_base.Toolbox()
-    deap_toolbox.register(
-        "individual",
-        deap_tools.initIterate,
-        deap_creator.Individual,
-        create_random_genome,
-    )
-    deap_toolbox.register(
-        "population", deap_tools.initRepeat, list, deap_toolbox.individual
-    )
+    deap_toolbox.register("individual", deap_tools.initIterate, deap_creator.Individual, create_random_genome)
+    deap_toolbox.register("population", deap_tools.initRepeat, list, deap_toolbox.individual)
     deap_toolbox.register("mate", deap_tools.cxTwoPoint)
     deap_toolbox.register("mutate", mutate, ind_pb=MUTATION_PROBABILITY)
     deap_toolbox.register("select", deap_tools.selTournament, tournsize=3)
     deap_toolbox.register("evaluate", evaluate_genome)
 
     population = deap_toolbox.population(n=POPULATION_SIZE)
-    best_scores = []
-    avg_scores = []
 
-    stats = deap_tools.Statistics(lambda ind: ind.fitness.values[0])
-    stats.register("avg", np.mean)
-    stats.register("max", np.max)
-    hof = deap_tools.HallOfFame(1)
+    stats_fit = deap_tools.Statistics(lambda ind: ind.fitness.values[0])
+    stats_score = deap_tools.Statistics(lambda ind: getattr(ind, 'actual_game_score', 0.0))
+    
+    mstats = deap_tools.MultiStatistics(fitness=stats_fit, game_score=stats_score)
+    mstats.register("avg", np.mean)
+    mstats.register("max", np.max)
+    
+    hof = deap_tools.HallOfFame(5)
 
     population, logbook = deap_algorithms.eaSimple(
-        population,
-        deap_toolbox,
-        cxpb=0.5,
-        mutpb=0.2,
-        ngen=GENERATIONS,
-        stats=stats,
-        halloffame=hof,
-        verbose=True,
+        population, deap_toolbox, cxpb=0.5, mutpb=0.2, ngen=GENERATIONS,
+        stats=mstats, halloffame=hof, verbose=True
     )
 
-    best_scores = logbook.select("max")
-    avg_scores = logbook.select("avg")
+    best_fitness_history = logbook.chapters["fitness"].select("max")
+    avg_fitness_history = logbook.chapters["fitness"].select("avg")
+    best_actual_scores = logbook.chapters["game_score"].select("max")
+
+    print("\n" + "="*40)
+    print("🏆 HALL OF FAME (Top Genomes) 🏆")
+    print("="*40)
+    for i, ind in enumerate(hof):
+        score_val = getattr(ind, 'actual_game_score', 0.0)
+        print(f"Rank {i+1} | Algorithmic Fitness: {ind.fitness.values[0]:.2f} | Actual Game Score: {score_val:.1f}")
+        print(f"↳ Genome Structure: {ind}\n")
 
     model_filepath = save_path.with_suffix(".pytorch")
     model_filepath.parent.mkdir(parents=True, exist_ok=True)
+
+    final_state_dict = _best_model_cache.state_dict() if _best_model_cache else build_mlp(hof[0])[0].state_dict()
 
     torch.save(
         {
             "genome": hof[0],
             "fitness": hof[0].fitness.values[0],
-            "state_dict": _best_model_cache.state_dict(),
+            "actual_score": getattr(hof[0], 'actual_game_score', 0.0),
+            "state_dict": final_state_dict,
             "n_inputs": N_INPUTS,
         },
         model_filepath,
     )
 
-    plt.figure(figsize=(10,5))
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
+    ax1.plot(smooth(best_fitness_history), color="tab:blue", label="Best Fitness (smoothed)")
+    ax1.plot(smooth(avg_fitness_history), color="tab:orange", label="Avg Fitness (smoothed)")
+    ax1.set_ylabel("Algorithmic Fitness", fontweight='bold')
+    ax1.set_title("Flappy Bird Genetic Architecture Evolution", fontsize=14, pad=15)
+    ax1.legend(loc="upper left")
+    ax1.grid(True, linestyle="--", alpha=0.5)
 
-    plt.plot(smooth(best_scores), label="Best Fitness (smoothed)")
-    plt.plot(smooth(avg_scores), label="Avg Fitness (smoothed)")
+    ax2.plot(smooth(best_actual_scores), color="tab:green", linewidth=2, label="Best Actual Game Score")
+    ax2.set_xlabel("Generation", fontweight='bold')
+    ax2.set_ylabel("Pipes Cleared (Actual Score)", fontweight='bold')
+    ax2.legend(loc="upper left")
+    ax2.grid(True, linestyle="--", alpha=0.5)
 
-    plt.xlabel("Generation")
-    plt.ylabel("Score")
-    plt.title("Flappy Bird Learning Curve")
-    plt.legend()
-    plt.grid()
-
+    plt.tight_layout()
     plt.show()
 
 
@@ -315,29 +294,24 @@ def display(load_path: Path):
     data = torch.load(model_filepath, map_location="cpu", weights_only=False)
 
     best_genome = data["genome"]
-    n_inputs = data["n_inputs"]
+    saved_score = data.get("actual_score", "N/A")
 
     model, _ = build_mlp(best_genome)
     model.load_state_dict(data["state_dict"])
     model.eval()
 
-    print((f"displaying result of genome:\n{best_genome}\n=> fitness={n_inputs}"))
+    print(f"Displaying result of genome:\n{best_genome}")
+    print(f"Saved Genome Fitness: {data['fitness']} | Saved Actual Game Score: {saved_score}")
 
     clock = pygame.time.Clock()
-
     screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
     pygame.display.set_caption("Phoenix Navigation")
 
     font = pygame.font.SysFont(None, 40)
-
     background_img = pygame.image.load("assets/background.png").convert()
-    background_img = pygame.transform.scale(
-        background_img, (SCREEN_WIDTH, SCREEN_HEIGHT)
-    )
-
+    background_img = pygame.transform.scale(background_img, (SCREEN_WIDTH, SCREEN_HEIGHT))
     bird_img = pygame.image.load("assets/phoenix.png").convert_alpha()
     bird_img = pygame.transform.smoothscale(bird_img, (90, 78))
-
     pipe_img = pygame.image.load("assets/bars.png").convert_alpha()
 
     game = FlappyBirdGame(background_img, bird_img, pipe_img, render=True)
@@ -351,19 +325,9 @@ def display(load_path: Path):
                 game.reset()
 
         if not game.done:
-            y, dx, dy = game.get_state()
+            dx, dy = game.get_state()
+            game_state = torch.tensor((dx, dy), dtype=torch.float32).unsqueeze(0)
 
-            if n_inputs == 2:
-                game_state = dx, dy
-            elif n_inputs == 3:
-                game_state = dx, dy, y
-            else:
-                raise NotImplementedError(
-                    f"missing game state implementation for N_INPUTS={N_INPUTS}"
-                )
-            game_state = torch.tensor(game_state, dtype=torch.float32).unsqueeze(0)
-
-            model.eval()
             with torch.no_grad():
                 logits = model(game_state)
                 should_jump = (logits > 0).item()
@@ -385,7 +349,6 @@ if __name__ == "__main__":
     torch.manual_seed(RANDOM_SEED)
 
     pygame.init()
-
     BASE_DIR = Path(__file__).parent
 
     if len(sys.argv) > 1 and sys.argv[1] == "--display":
